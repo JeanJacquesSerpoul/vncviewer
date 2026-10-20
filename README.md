@@ -1,9 +1,27 @@
 # vncviewer
 
 [![CI](https://github.com/JeanJacquesSerpoul/vncviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/JeanJacquesSerpoul/vncviewer/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/JeanJacquesSerpoul/vncviewer)](https://github.com/JeanJacquesSerpoul/vncviewer/releases/latest)
 
 Connexion distante via VNC — visionneuse de bureau écrite en Rust avec
 [Tauri 2](https://tauri.app) et [Leptos](https://leptos.dev).
+
+## Télécharger
+
+Les installateurs de la dernière version sont sur la page
+**[Releases](https://github.com/JeanJacquesSerpoul/vncviewer/releases/latest)** :
+
+| Système | Fichier |
+|---|---|
+| Debian, Ubuntu | `.deb` : `sudo apt install ./VNC.Viewer_*_amd64.deb` |
+| Fedora, openSUSE | `.rpm` |
+| Autres Linux | `.AppImage` (le rendre exécutable puis le lancer) |
+| Windows | `-setup.exe` ou `.msi` |
+| macOS Apple Silicon / Intel | `aarch64.dmg` / `x64.dmg` |
+
+Les installateurs ne sont pas signés : Windows (SmartScreen) et macOS demandent une
+confirmation au premier lancement ; la marche à suivre est indiquée sur la page de
+la release. Pour compiler depuis les sources, voir plus bas.
 
 ## Fonctionnalités
 
@@ -52,7 +70,7 @@ trame avant que le backend ne demande la suivante (pas d'accumulation de latence
 - Sous Linux, les dépendances système de Tauri (WebKitGTK 4.1, etc.), voir
   <https://tauri.app/start/prerequisites/>
 
-## Installer sous Linux
+## Compiler et installer sous Linux
 
 ```bash
 ./install.sh --deps
