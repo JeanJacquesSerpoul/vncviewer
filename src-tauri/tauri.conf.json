@@ -27,6 +27,18 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Jean-Jacques Serpoul",
+    "copyright": "Copyright © 2026 Jean-Jacques Serpoul",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
+    "category": "Utility",
+    "shortDescription": "VNC remote desktop viewer",
+    "longDescription": "Remote desktop viewer for the VNC (RFB) protocol, written in Rust with Tauri and Leptos. French and English interface.",
+    "linux": {
+      "deb": {
+        "section": "net"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

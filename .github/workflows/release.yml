@@ -1,0 +1,143 @@
+name: Release
+
+# Pousser un tag vX.Y.Z (égal à la version de src-tauri/tauri.conf.json) construit
+# les installateurs Linux, Windows et macOS et les joint à une release brouillon.
+# Relecture puis publication de la release : à la main, sur GitHub.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag existant à (re)construire, par exemple v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+  TAURI_CLI_VERSION: 2.12.3
+
+jobs:
+  draft:
+    name: Release brouillon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Vérifier que le tag correspond à la version
+        run: |
+          version="$(jq -r .version src-tauri/tauri.conf.json)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::le tag $TAG ne correspond pas à la version $version de src-tauri/tauri.conf.json"
+            exit 1
+          fi
+
+      - name: Créer la release brouillon
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "La release $TAG existe déjà : les installateurs y seront remplacés."
+            exit 0
+          fi
+          cat >notes.md <<'EOF'
+          ## Installation
+
+          | Système | Fichier |
+          |---|---|
+          | Debian, Ubuntu | `.deb` : `sudo apt install ./VNC.Viewer_*_amd64.deb` |
+          | Fedora, openSUSE | `.rpm` |
+          | Autres Linux | `.AppImage` (le rendre exécutable puis le lancer) |
+          | Windows | `-setup.exe` ou `.msi` |
+          | macOS (Apple Silicon / Intel) | `aarch64.dmg` / `x64.dmg` |
+
+          Les installateurs ne sont pas signés : Windows SmartScreen peut demander
+          une confirmation (« Informations complémentaires » → « Exécuter quand même ») ;
+          sur macOS, ouvrir l'application une première fois par clic droit → « Ouvrir ».
+          EOF
+          gh release create "$TAG" --draft --verify-tag --title "VNC Viewer $TAG" \
+            --notes-file notes.md --generate-notes
+
+  build:
+    name: Installateurs (${{ matrix.name }})
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 : glibc plus ancienne, paquets compatibles avec plus de distributions.
+          - name: Linux
+            os: ubuntu-22.04
+            targets: wasm32-unknown-unknown
+            args: ""
+          - name: Windows
+            os: windows-latest
+            targets: wasm32-unknown-unknown
+            args: ""
+          - name: macOS Apple Silicon
+            os: macos-latest
+            targets: wasm32-unknown-unknown,aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - name: macOS Intel
+            os: macos-latest
+            targets: wasm32-unknown-unknown,x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Dépendances système de Tauri
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf file
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - uses: ./.github/actions/setup-trunk
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Exécute aussi `trunk build --release` (beforeBuildCommand de tauri.conf.json).
+      - name: Construire les installateurs
+        shell: bash
+        run: npx --yes "@tauri-apps/cli@$TAURI_CLI_VERSION" build ${{ matrix.args }}
+
+      - name: Joindre les installateurs à la release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=()
+          for dir in target/release/bundle target/*/release/bundle; do
+            files+=("$dir"/deb/*.deb "$dir"/rpm/*.rpm "$dir"/appimage/*.AppImage)
+            files+=("$dir"/msi/*.msi "$dir"/nsis/*.exe "$dir"/dmg/*.dmg)
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::aucun installateur produit"
+            exit 1
+          fi
+          printf 'Envoi de %s\n' "${files[@]}"
+          gh release upload "$TAG" "${files[@]}" --clobber

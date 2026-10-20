@@ -1,0 +1,51 @@
+name: Setup Trunk
+description: Installe une version figée de Trunk (binaire officiel, somme de contrôle vérifiée).
+
+inputs:
+  version:
+    description: Version de Trunk (tag GitHub de trunk-rs/trunk)
+    default: v0.21.14
+
+runs:
+  using: composite
+  steps:
+    - name: Installer Trunk ${{ inputs.version }}
+      shell: bash
+      env:
+        TRUNK_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) asset="trunk-x86_64-unknown-linux-gnu.tar.gz" ;;
+          Linux-ARM64) asset="trunk-aarch64-unknown-linux-gnu.tar.gz" ;;
+          macOS-X64) asset="trunk-x86_64-apple-darwin.tar.gz" ;;
+          macOS-ARM64) asset="trunk-aarch64-apple-darwin.tar.gz" ;;
+          Windows-X64) asset="trunk-x86_64-pc-windows-msvc.zip" ;;
+          *) echo "::error::plateforme non gérée : ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+        esac
+
+        tmp="$RUNNER_TEMP"
+        if command -v cygpath >/dev/null; then tmp="$(cygpath -u "$tmp")"; fi
+        dir="$tmp/trunk-$TRUNK_VERSION"
+        mkdir -p "$dir"
+        cd "$dir"
+
+        base="https://github.com/trunk-rs/trunk/releases/download/$TRUNK_VERSION"
+        curl -fsSLO "$base/$asset"
+        expected="$(curl -fsSL "$base/$asset.sha256" | awk '{print $1}')"
+        if command -v sha256sum >/dev/null; then
+          actual="$(sha256sum "$asset" | awk '{print $1}')"
+        else
+          actual="$(shasum -a 256 "$asset" | awk '{print $1}')"
+        fi
+        if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+          echo "::error::somme de contrôle invalide pour $asset"
+          exit 1
+        fi
+        case "$asset" in
+          *.zip) 7z x -y "$asset" >/dev/null ;;
+          *) tar -xzf "$asset" ;;
+        esac
+        rm -f "$asset"
+
+        if command -v cygpath >/dev/null; then cygpath -w "$dir"; else echo "$dir"; fi >>"$GITHUB_PATH"

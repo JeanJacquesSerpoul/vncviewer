@@ -44,7 +44,7 @@ Options :
   --system        installe pour tous les utilisateurs dans /usr/local (via sudo)
   --prefix DIR    répertoire d'installation (défaut : ~/.local, ou /usr/local
                   avec --system)
-  --skip-build    installe le binaire déjà compilé (target/release/vncviewer)
+  --skip-build    installe le binaire déjà compilé (target/release/$BIN_NAME)
   --uninstall     supprime les fichiers installés
   -h, --help      affiche cette aide
 
@@ -226,7 +226,7 @@ if [[ $skip_build -eq 0 ]]; then
     cargo build --release --locked -p vncviewer --features tauri/custom-protocol
 fi
 
-binary="$ROOT/target/release/vncviewer"
+binary="$ROOT/target/release/$BIN_NAME"
 [[ -x "$binary" ]] || die "binaire introuvable : $binary (lancez le script sans --skip-build)"
 
 # ---- Installation -----------------------------------------------------------

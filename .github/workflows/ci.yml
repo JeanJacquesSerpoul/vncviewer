@@ -12,7 +12,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  TRUNK_VERSION: v0.21.14
 
 jobs:
   check:
@@ -34,13 +33,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Installer Trunk
-        run: |
-          base="https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}"
-          file="trunk-x86_64-unknown-linux-gnu.tar.gz"
-          curl -fsSLO "$base/$file"
-          curl -fsSL "$base/$file.sha256" | awk '{print $1"  '"$file"'"}' | sha256sum -c -
-          tar -xzf "$file" -C "$HOME/.cargo/bin" trunk
+      - uses: ./.github/actions/setup-trunk
 
       - name: Formatage
         run: cargo fmt --all --check

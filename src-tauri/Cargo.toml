@@ -4,6 +4,12 @@ version = "0.1.0"
 description = "Visionneuse VNC (Rust · Tauri · Leptos)"
 edition = "2024"
 license = "MIT"
+# Not `vncviewer`, which would clash with TigerVNC / RealVNC (`/usr/bin/vncviewer`).
+default-run = "vnc-viewer"
+
+[[bin]]
+name = "vnc-viewer"
+path = "src/main.rs"
 
 [lib]
 name = "vncviewer_lib"
