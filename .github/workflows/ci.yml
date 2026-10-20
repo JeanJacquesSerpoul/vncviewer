@@ -45,6 +45,9 @@ jobs:
       - name: Formatage
         run: cargo fmt --all --check
 
+      - name: Script d'installation
+        run: shellcheck install.sh
+
       # Also produces dist/, which `tauri::generate_context!` needs to compile.
       - name: Build de l'interface (wasm)
         run: trunk build
