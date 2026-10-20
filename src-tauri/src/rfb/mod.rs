@@ -90,7 +90,13 @@ mod tests {
     #[test]
     fn errors_map_to_language_neutral_codes() {
         let eof = Error::Io(std::io::ErrorKind::UnexpectedEof.into());
-        assert_eq!(eof.info(), ErrorInfo { code: "serverClosed", detail: None });
+        assert_eq!(
+            eof.info(),
+            ErrorInfo {
+                code: "serverClosed",
+                detail: None
+            }
+        );
         let e = Error::UnsupportedSecurity(vec![16, 19]);
         assert_eq!(e.info().detail.as_deref(), Some("16, 19"));
         let json = serde_json::to_string(&Error::AuthFailed(None).info()).unwrap();

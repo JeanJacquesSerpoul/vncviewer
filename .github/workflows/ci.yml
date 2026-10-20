@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TRUNK_VERSION: v0.21.14
+
+jobs:
+  check:
+    name: Lint, tests, build wasm (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances système de Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Installer Trunk
+        run: |
+          base="https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}"
+          file="trunk-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSLO "$base/$file"
+          curl -fsSL "$base/$file.sha256" | awk '{print $1"  '"$file"'"}' | sha256sum -c -
+          tar -xzf "$file" -C "$HOME/.cargo/bin" trunk
+
+      - name: Formatage
+        run: cargo fmt --all --check
+
+      # Also produces dist/, which `tauri::generate_context!` needs to compile.
+      - name: Build de l'interface (wasm)
+        run: trunk build
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  test:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `tauri::generate_context!` requires the frontend directory to exist.
+      - name: Dossier dist
+        shell: bash
+        run: mkdir -p dist
+
+      - name: Tests
+        run: cargo test --workspace

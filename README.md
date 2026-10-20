@@ -1,5 +1,7 @@
 # vncviewer
 
+[![CI](https://github.com/JeanJacquesSerpoul/vncviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/JeanJacquesSerpoul/vncviewer/actions/workflows/ci.yml)
+
 Connexion distante via VNC — visionneuse de bureau écrite en Rust avec
 [Tauri 2](https://tauri.app) et [Leptos](https://leptos.dev).
 
