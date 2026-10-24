@@ -120,11 +120,31 @@ are in French.
 cargo tauri dev
 ```
 
-## Build the packages
+## Build the installers
+
+The scripts produce the same installers as the GitHub release, in
+`target/release/bundle/`, and download the missing tools (Trunk, Tauri CLI).
+
+Linux (`.deb`, `.rpm`, `.AppImage`):
 
 ```bash
-cargo tauri build
+./linux-build.sh --deps            # system dependencies + Rust, then build
+./linux-build.sh --install         # build, then install the .deb (apt) or .rpm (dnf, zypper)
+./linux-build.sh --bundles deb     # a single format
 ```
+
+Windows (NSIS setup and `.msi`), in PowerShell:
+
+```powershell
+.\windows-build.ps1 -Deps         # Rust and Visual Studio C++ tools (winget), then build
+.\windows-build.ps1 -Install      # build, then run the installer
+.\windows-build.ps1 -Bundles nsis # a single format
+```
+
+If PowerShell refuses to run the script:
+`powershell -ExecutionPolicy Bypass -File .\windows-build.ps1`.
+
+With the Tauri CLI directly: `cargo tauri build`.
 
 ## Tests
 

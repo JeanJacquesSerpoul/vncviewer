@@ -38,8 +38,8 @@ jobs:
       - name: Formatage
         run: cargo fmt --all --check
 
-      - name: Script d'installation
-        run: shellcheck install.sh
+      - name: Scripts d'installation
+        run: shellcheck install.sh linux-build.sh
 
       # Also produces dist/, which `tauri::generate_context!` needs to compile.
       - name: Build de l'interface (wasm)
@@ -69,6 +69,14 @@ jobs:
       - name: Dossier dist
         shell: bash
         run: mkdir -p dist
+
+      - name: Script de construction Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $issues = Invoke-ScriptAnalyzer -Path windows-build.ps1 -Severity Error
+          $issues | Format-Table -AutoSize
+          if ($issues) { exit 1 }
 
       - name: Tests
         run: cargo test --workspace

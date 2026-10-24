@@ -120,11 +120,31 @@ entrée de menu et icônes. `--deps` installe d'abord les dépendances de compil
 cargo tauri dev
 ```
 
-## Construire les paquets
+## Construire les installateurs
+
+Les scripts produisent les mêmes installateurs que la release GitHub, dans
+`target/release/bundle/`, et téléchargent les outils manquants (Trunk, Tauri CLI).
+
+Linux (`.deb`, `.rpm`, `.AppImage`) :
 
 ```bash
-cargo tauri build
+./linux-build.sh --deps            # dépendances système + Rust, puis construction
+./linux-build.sh --install         # construit puis installe le .deb (apt) ou le .rpm (dnf, zypper)
+./linux-build.sh --bundles deb     # un seul format
 ```
+
+Windows (setup NSIS et `.msi`), dans PowerShell :
+
+```powershell
+.\windows-build.ps1 -Deps         # Rust et outils C++ de Visual Studio (winget), puis construction
+.\windows-build.ps1 -Install      # construit puis lance l'installateur
+.\windows-build.ps1 -Bundles nsis # un seul format
+```
+
+Si PowerShell refuse d'exécuter le script :
+`powershell -ExecutionPolicy Bypass -File .\windows-build.ps1`.
+
+Directement avec la Tauri CLI : `cargo tauri build`.
 
 ## Tests
 
