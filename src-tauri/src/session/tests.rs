@@ -700,6 +700,8 @@ async fn extended_clipboard_and_remote_resize() {
         Out::Cut(t) => assert_eq!(t, "ok\nUTF-8 ✓"),
         Out::Msg(m) => panic!("expected cut text, got {m:?}"),
     }
+    // Text the server already has is not sent back.
+    assert!(!session.send_cut_text("ok\nUTF-8 ✓"));
 
     // No ExtendedDesktopSize yet: resize requests are dropped.
     session.set_desktop_size(10, 10);

@@ -106,6 +106,9 @@ struct Shared {
     extended_clipboard: bool,
     /// Local clipboard text announced to the server, provided on request.
     local_text: Option<String>,
+    /// Last clipboard text exchanged with this server in either direction,
+    /// so it is neither sent again nor echoed back.
+    last_text: Option<String>,
     /// Screen id from ExtendedDesktopSize, once the server announced it.
     screen_id: Option<u32>,
 }
@@ -246,8 +249,14 @@ impl Session {
         }
     }
 
-    pub fn send_cut_text(&self, text: &str) {
+    /// Sends local clipboard text, unless this server already has it.
+    /// Returns whether it was sent.
+    pub fn send_cut_text(&self, text: &str) -> bool {
         let mut shared = self.shared.lock().unwrap();
+        if shared.last_text.as_deref() == Some(text) {
+            return false;
+        }
+        shared.last_text = Some(text.to_owned());
         let msg = if shared.extended_clipboard {
             // Announce it; the server asks for the content when it wants it.
             shared.local_text = Some(text.to_owned());
@@ -255,7 +264,7 @@ impl Session {
         } else {
             proto::client_cut_text(text)
         };
-        let _ = self.out.send(Outgoing::Bytes(msg));
+        self.out.send(Outgoing::Bytes(msg)).is_ok()
     }
 
     /// Asks the server to resize its desktop, if it supports it.
@@ -385,7 +394,7 @@ where
                     ch.out.send(next).map_err(|_| rfb::Error::ConnectionLost)?;
                 }
                 ServerMessage::Bell => sink.message(encode_event(&Event::Bell)),
-                ServerMessage::CutText(text) => sink.cut_text(text),
+                ServerMessage::CutText(text) => remote_text(text, &sink, &ch),
                 ServerMessage::Clipboard(msg) => handle_clipboard(msg, &sink, &ch)?,
                 ServerMessage::SetColourMap => {}
             }
@@ -419,10 +428,16 @@ fn handle_clipboard<S: Sink>(msg: ClipMessage, sink: &S, ch: &Channels) -> rfb::
             let has_text = ch.shared.lock().unwrap().local_text.is_some();
             ch.send(xclip::notify(has_text))?;
         }
-        ClipMessage::Provide(Some(text)) => sink.cut_text(text),
+        ClipMessage::Provide(Some(text)) => remote_text(text, sink, ch),
         ClipMessage::Provide(None) => {}
     }
     Ok(())
+}
+
+/// Clipboard text copied on the server: remember it, then hand it to the sink.
+fn remote_text<S: Sink>(text: String, sink: &S, ch: &Channels) {
+    ch.shared.lock().unwrap().last_text = Some(text.clone());
+    sink.cut_text(text);
 }
 
 /// Opens the byte stream to the VNC server, through SSH if configured.

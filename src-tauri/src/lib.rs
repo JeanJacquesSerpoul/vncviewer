@@ -138,19 +138,17 @@ fn set_desktop_size(window: WebviewWindow, state: State<'_, AppState>, width: u1
     state.with_session(&window, |s| s.set_desktop_size(width, height));
 }
 
-/// Sends the local clipboard to the server if it changed. Returns whether it was sent.
+/// Sends the local clipboard to the server unless the session already has it.
+/// Returns whether it was sent.
 #[tauri::command]
 async fn send_clipboard(window: WebviewWindow, state: State<'_, AppState>) -> Result<bool, String> {
     let clipboard = state.clipboard.clone();
-    let text = tauri::async_runtime::spawn_blocking(move || clipboard.take_local_if_changed())
+    let text = tauri::async_runtime::spawn_blocking(move || clipboard.local_text())
         .await
         .map_err(|e| e.to_string())?;
     let mut sent = false;
     if let Some(text) = text {
-        state.with_session(&window, |s| {
-            s.send_cut_text(&text);
-            sent = true;
-        });
+        state.with_session(&window, |s| sent = s.send_cut_text(&text));
     }
     Ok(sent)
 }
