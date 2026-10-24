@@ -165,6 +165,11 @@ fn toggle_fullscreen(window: WebviewWindow) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn is_fullscreen(window: WebviewWindow) -> bool {
+    window.is_fullscreen().unwrap_or(false)
+}
+
+#[tauri::command]
 fn set_title(window: WebviewWindow, title: String) -> Result<(), String> {
     window.set_title(&title).map_err(|e| e.to_string())
 }
@@ -275,6 +280,7 @@ pub fn run() {
             set_desktop_size,
             send_clipboard,
             toggle_fullscreen,
+            is_fullscreen,
             set_title,
             new_window,
             save_screenshot,

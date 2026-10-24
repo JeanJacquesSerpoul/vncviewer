@@ -1,7 +1,7 @@
 //! Remote screen: draws backend messages on the canvas and forwards input.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use js_sys::{DataView, Reflect, Uint8Array, Uint8ClampedArray};
 use serde::Serialize;
@@ -25,12 +25,36 @@ pub enum InputEvent {
     Key { keysym: u32, down: bool },
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectParams {
     pub host: String,
     pub port: u16,
+    pub username: Option<String>,
     pub password: Option<String>,
     pub shared: bool,
+    pub trusted_cert: Option<String>,
+    pub quality: &'static str,
+    pub ssh: Option<SshParams>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshParams {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: Option<String>,
+    pub trusted_key: Option<String>,
+}
+
+/// Shortcuts handled locally instead of being sent to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hotkey {
+    /// Ctrl+Alt+Enter.
+    ToggleFullscreen,
+    /// F8.
+    ToggleToolbar,
 }
 
 #[derive(Default)]
@@ -44,6 +68,13 @@ struct State {
     buttons: u8,
     pos: (u16, u16),
     wheel: f64,
+    /// Input is not sent to the server.
+    view_only: bool,
+    /// Keys whose press was a [`Hotkey`]: their release is swallowed too.
+    swallowed: HashSet<String>,
+    /// Frames and bytes drawn since the last [`take_stats`].
+    frames: u32,
+    bytes: u64,
 }
 
 thread_local! {
@@ -74,10 +105,15 @@ pub async fn connect(
     // The channel lives as long as the page; so does its handler.
     handler.forget();
 
-    let args =
-        serde_wasm_bindgen::to_value(&params).map_err(|e| UiError::Internal(e.to_string()))?;
+    let args = js_sys::Object::new();
+    let params = params
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|e| UiError::Internal(e.to_string()))?;
+    Reflect::set(&args, &"params".into(), &params)
+        .map_err(|e| UiError::Internal(tauri::error_text(&e)))?;
     Reflect::set(&args, &"onMessage".into(), &channel)
         .map_err(|e| UiError::Internal(tauri::error_text(&e)))?;
+    let args: JsValue = args.into();
     tauri::invoke_raw("connect", args)
         .await
         .map(|_| ())
@@ -99,9 +135,64 @@ fn reset_input() {
     STATE.with_borrow_mut(|s| {
         s.queue.clear();
         s.pressed.clear();
+        s.swallowed.clear();
         s.buttons = 0;
         s.wheel = 0.0;
     });
+}
+
+/// Frames drawn and bytes received since the last call.
+pub fn take_stats() -> (u32, u64) {
+    STATE.with_borrow_mut(|s| (std::mem::take(&mut s.frames), std::mem::take(&mut s.bytes)))
+}
+
+/// Stops (or resumes) sending keyboard and mouse input.
+pub fn set_view_only(on: bool) {
+    if on {
+        release_all();
+    }
+    STATE.with_borrow_mut(|s| s.view_only = on);
+}
+
+/// Saves the canvas as PNG (the backend asks where). Returns whether it was saved.
+pub async fn screenshot(canvas: &HtmlCanvasElement, file_name: &str) -> Result<bool, String> {
+    let (tx, rx) = promise_channel();
+    let cb = Closure::once(move |blob: JsValue| {
+        let _ = tx.send(blob);
+    });
+    canvas
+        .to_blob(cb.as_ref().unchecked_ref())
+        .map_err(|e| tauri::error_text(&e))?;
+    let blob: web_sys::Blob = rx
+        .await
+        .map_err(|_| "no image".to_string())?
+        .dyn_into()
+        .map_err(|_| "no image".to_string())?;
+    let buf = wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(|e| tauri::error_text(&e))?;
+    let bytes = Uint8Array::new(&buf);
+    let saved =
+        tauri::invoke_bytes("save_screenshot", &bytes, &[("x-file-name", file_name)]).await?;
+    Ok(saved.as_bool().unwrap_or(false))
+}
+
+/// A one-shot channel built on a JS promise.
+fn promise_channel() -> (PromiseTx, wasm_bindgen_futures::JsFuture) {
+    let mut resolve = None;
+    let promise = js_sys::Promise::new(&mut |res, _rej| resolve = Some(res));
+    (
+        PromiseTx(resolve.expect("promise executor runs synchronously")),
+        wasm_bindgen_futures::JsFuture::from(promise),
+    )
+}
+
+struct PromiseTx(js_sys::Function);
+
+impl PromiseTx {
+    fn send(self, v: JsValue) -> Result<(), JsValue> {
+        self.0.call1(&JsValue::NULL, &v).map(|_| ())
+    }
 }
 
 // ---- Rendering --------------------------------------------------------------
@@ -154,6 +245,10 @@ fn handle_message(
             on_event(event);
         }
         wire::MSG_RECTS => {
+            STATE.with_borrow_mut(|s| {
+                s.frames += 1;
+                s.bytes += bytes.byte_length() as u64;
+            });
             let ctx = context_2d(canvas)?;
             for block in wire::rects(&view)? {
                 ctx.put_image_data(&image_data(&bytes, &block)?, block.x as f64, block.y as f64)?;
@@ -161,7 +256,7 @@ fn handle_message(
             tauri::invoke_detached("frame_ack");
         }
         wire::MSG_CURSOR => set_cursor(canvas, &bytes, &wire::cursor(&view)?)?,
-        k => return Err(format!("type de message inconnu : {k}").into()),
+        k => return Err(format!("unknown message type {k}").into()),
     }
     Ok(())
 }
@@ -169,7 +264,7 @@ fn handle_message(
 fn context_2d(canvas: &HtmlCanvasElement) -> Result<CanvasRenderingContext2d, JsValue> {
     Ok(canvas
         .get_context("2d")?
-        .ok_or("pas de contexte 2d")?
+        .ok_or("no 2d context")?
         .dyn_into()?)
 }
 
@@ -194,7 +289,7 @@ fn set_cursor(
     }
     let document = web_sys::window()
         .and_then(|w| w.document())
-        .ok_or("pas de document")?;
+        .ok_or("no document")?;
     let tmp: HtmlCanvasElement = document.create_element("canvas")?.dyn_into()?;
     tmp.set_width(c.w);
     tmp.set_height(c.h);
@@ -207,7 +302,10 @@ fn set_cursor(
 
 /// Queues an input event; events are sent in order, batched while a call is in flight.
 fn push(ev: InputEvent) {
-    STATE.with_borrow_mut(|s| {
+    let dropped = STATE.with_borrow_mut(|s| {
+        if s.view_only {
+            return true;
+        }
         // Successive moves with the same buttons: only the last position matters.
         if let (Some(InputEvent::Pointer { mask: last, .. }), InputEvent::Pointer { mask, .. }) =
             (s.queue.last(), ev)
@@ -216,8 +314,11 @@ fn push(ev: InputEvent) {
             s.queue.pop();
         }
         s.queue.push(ev);
+        false
     });
-    flush();
+    if !dropped {
+        flush();
+    }
 }
 
 fn flush() {
@@ -236,7 +337,7 @@ fn flush() {
     }
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = tauri::invoke("input", &Args { events }).await {
-            web_sys::console::warn_1(&format!("input : {e}").into());
+            web_sys::console::warn_1(&format!("input: {e}").into());
         }
         STATE.with_borrow_mut(|s| s.sending = false);
         flush();
@@ -326,10 +427,23 @@ pub fn on_wheel(ev: &WheelEvent, canvas: &HtmlCanvasElement) {
     }
 }
 
-pub fn on_key(ev: &KeyboardEvent, down: bool) {
+fn hotkey(ev: &KeyboardEvent) -> Option<Hotkey> {
+    let key = ev.key();
+    if ev.ctrl_key() && ev.alt_key() && !ev.shift_key() && key == "Enter" {
+        return Some(Hotkey::ToggleFullscreen);
+    }
+    if key == "F8" && !ev.ctrl_key() && !ev.alt_key() && !ev.shift_key() && !ev.meta_key() {
+        return Some(Hotkey::ToggleToolbar);
+    }
+    None
+}
+
+/// Forwards a key event, unless it is a local shortcut: then it is returned
+/// (on press) and nothing is sent, not even the release.
+pub fn on_key(ev: &KeyboardEvent, down: bool) -> Option<Hotkey> {
     // Let the IME finish composing; the composed text arrives as key events after.
     if ev.is_composing() {
-        return;
+        return None;
     }
     ev.prevent_default();
     let (key, code) = (ev.key(), ev.code());
@@ -338,6 +452,13 @@ pub fn on_key(ev: &KeyboardEvent, down: bool) {
     } else {
         code.clone()
     };
+    if down && let Some(h) = hotkey(ev) {
+        STATE.with_borrow_mut(|s| s.swallowed.insert(id));
+        return (!ev.repeat()).then_some(h);
+    }
+    if !down && STATE.with_borrow_mut(|s| s.swallowed.remove(&id)) {
+        return None;
+    }
     let keysym = STATE.with_borrow_mut(|s| {
         if down {
             let ks = keysym::keysym(&key, &code)?;
@@ -352,6 +473,7 @@ pub fn on_key(ev: &KeyboardEvent, down: bool) {
     if let Some(keysym) = keysym {
         push(InputEvent::Key { keysym, down });
     }
+    None
 }
 
 /// Releases every key and button still held (e.g. when the canvas loses focus).

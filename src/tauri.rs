@@ -7,6 +7,13 @@ use wasm_bindgen::prelude::*;
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke, catch)]
     async fn tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke, catch)]
+    async fn tauri_invoke_with(
+        cmd: &str,
+        args: JsValue,
+        options: JsValue,
+    ) -> Result<JsValue, JsValue>;
 }
 
 #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
@@ -26,6 +33,23 @@ pub async fn invoke_raw(cmd: &str, args: JsValue) -> Result<JsValue, JsValue> {
     tauri_invoke(cmd, args).await
 }
 
+/// Calls a command with a raw binary body and request headers.
+pub async fn invoke_bytes(
+    cmd: &str,
+    body: &js_sys::Uint8Array,
+    headers: &[(&str, &str)],
+) -> Result<JsValue, String> {
+    let h = js_sys::Object::new();
+    for (k, v) in headers {
+        js_sys::Reflect::set(&h, &(*k).into(), &(*v).into()).map_err(|e| error_text(&e))?;
+    }
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(&options, &"headers".into(), &h).map_err(|e| error_text(&e))?;
+    tauri_invoke_with(cmd, body.into(), options.into())
+        .await
+        .map_err(|e| error_text(&e))
+}
+
 pub fn error_text(e: &JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))
 }
@@ -43,7 +67,16 @@ pub async fn invoke<A: Serialize>(cmd: &str, args: &A) -> Result<JsValue, String
 pub fn invoke_detached(cmd: &'static str) {
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = invoke_value(cmd, JsValue::UNDEFINED).await {
-            web_sys::console::warn_1(&format!("{cmd} : {e}").into());
+            web_sys::console::warn_1(&format!("{cmd}: {e}").into());
+        }
+    });
+}
+
+/// Fire-and-forget call of a command with arguments.
+pub fn invoke_detached_with<A: Serialize + 'static>(cmd: &'static str, args: A) {
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = invoke(cmd, &args).await {
+            web_sys::console::warn_1(&format!("{cmd}: {e}").into());
         }
     });
 }

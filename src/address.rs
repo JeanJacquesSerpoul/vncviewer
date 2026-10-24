@@ -5,6 +5,56 @@ pub enum AddressError {
     Empty,
     InvalidPort(String),
     BadIpv6,
+    /// The SSH target has no `user@` part.
+    MissingUser,
+}
+
+/// An SSH server to tunnel through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub user: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Parses `user@host`, `user@host:port` or `user@[v6addr]:port`.
+pub fn parse_ssh(target: &str) -> Result<SshTarget, AddressError> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(AddressError::Empty);
+    }
+    let (user, rest) = target.rsplit_once('@').ok_or(AddressError::MissingUser)?;
+    if user.is_empty() {
+        return Err(AddressError::MissingUser);
+    }
+    let parse = |s: &str| {
+        s.parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+            .ok_or_else(|| AddressError::InvalidPort(s.into()))
+    };
+    let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let (addr, tail) = v6.split_once(']').ok_or(AddressError::BadIpv6)?;
+        match tail.strip_prefix(':') {
+            Some(p) => (addr, parse(p)?),
+            None if tail.is_empty() => (addr, 22),
+            None => return Err(AddressError::BadIpv6),
+        }
+    } else {
+        match rest.split_once(':') {
+            Some((h, p)) if !p.contains(':') => (h, parse(p)?),
+            Some(_) => (rest, 22), // bare IPv6 address
+            None => (rest, 22),
+        }
+    };
+    if host.is_empty() {
+        return Err(AddressError::Empty);
+    }
+    Ok(SshTarget {
+        user: user.into(),
+        host: host.into(),
+        port,
+    })
 }
 
 /// Resolves `host` and the port field into a host and a TCP port:
@@ -78,5 +128,25 @@ mod tests {
         );
         assert_eq!(resolve("[::1", 5900), Err(AddressError::BadIpv6));
         assert_eq!(resolve(" ", 5900), Err(AddressError::Empty));
+    }
+
+    #[test]
+    fn ssh_targets() {
+        let t = |user: &str, host: &str, port| SshTarget {
+            user: user.into(),
+            host: host.into(),
+            port,
+        };
+        assert_eq!(parse_ssh("me@gw"), Ok(t("me", "gw", 22)));
+        assert_eq!(parse_ssh(" me@gw:2222 "), Ok(t("me", "gw", 2222)));
+        assert_eq!(parse_ssh("a@b@gw"), Ok(t("a@b", "gw", 22)));
+        assert_eq!(parse_ssh("me@[::1]:23"), Ok(t("me", "::1", 23)));
+        assert_eq!(parse_ssh("me@fe80::1"), Ok(t("me", "fe80::1", 22)));
+        assert_eq!(parse_ssh("gw"), Err(AddressError::MissingUser));
+        assert_eq!(
+            parse_ssh("me@gw:0"),
+            Err(AddressError::InvalidPort("0".into()))
+        );
+        assert_eq!(parse_ssh("me@"), Err(AddressError::Empty));
     }
 }

@@ -28,14 +28,34 @@ see below.
 ## Features
 
 - RFB 3.3 / 3.7 / 3.8 protocol implemented in Rust (no external VNC library).
-- Security: none, or VNC authentication (password, DES).
-- Encodings: ZRLE, Hextile, RRE, CopyRect, Raw; cursor pseudo-encoding
-  (the remote cursor is drawn locally), desktop resize and LastRect.
-- Full keyboard support (X11 keysyms, numeric keypad, AltGr),
-  3-button mouse and wheel, Ctrl+Alt+Del.
-- Two-way clipboard: text copied on the server lands in the local clipboard; the
-  local clipboard is sent when the view regains focus (or with the "Clipboard" button).
-- "Fit" mode (scaled to the window) or actual size with scrolling, full screen.
+- Security:
+  - none, VNC authentication (password, DES) or Apple authentication (macOS
+    Screen Sharing, user name and password);
+  - **VeNCrypt with TLS** (X509None, X509Vnc, X509Plain): a certificate signed by
+    a known authority is accepted directly; a self-signed certificate is shown
+    with its SHA-256 fingerprint and remembered once trusted;
+  - built-in **SSH tunnel** (`user@gateway[:port]`): host key checked against
+    `~/.ssh/known_hosts` (added once trusted), authentication with the SSH agent,
+    the keys in `~/.ssh` or a password;
+  - the padlock in the toolbar tells whether the session is encrypted.
+- The password is only asked for when the server requires one; it can be saved
+  in the system keychain (never in the settings).
+- Encodings: Tight (JPEG, palette, gradient), ZRLE, Hextile, RRE, CopyRect, Raw;
+  three quality levels (lossless, good, low bandwidth); cursor, desktop resize
+  (including ExtendedDesktopSize) and LastRect pseudo-encodings.
+- Full keyboard support (X11 keysyms, numeric keypad, AltGr), 3-button mouse and
+  wheel; "Keys" menu: Ctrl+Alt+Del, Alt+Tab, Windows key, Print Screen, F1–F12…
+- Two-way clipboard, in UTF-8 with servers that support the extended clipboard
+  (Latin-1 otherwise): text copied on the server lands in the local clipboard;
+  the local clipboard is sent when the view regains focus (or with its button).
+- Display: fit to the window or zoom from 50 to 200 %, optional smoothing, remote
+  resolution following the window (when the server allows it).
+- Full screen with an auto-hidden toolbar: it shows at the top edge or with F8;
+  Ctrl+Alt+Enter toggles full screen.
+- View-only mode, PNG screenshot, frames per second and bandwidth in the toolbar.
+- Automatic reconnection when the connection drops; cancellable connection.
+- Connection history and favourites; several windows (one session each).
+- Light or dark theme following the system; window size and position remembered.
 - French / English interface: system language by default, FR/EN switch on the
   connection screen and in the toolbar, choice remembered.
 - VNC address notations: `host`, `host:1` (display → port 5901), `host::5901`, `[::1]:0`.
@@ -44,15 +64,20 @@ see below.
 
 ```
 src/              Leptos UI (WebAssembly, built by Trunk)
-  app.rs          connection screen and toolbar
+  app.rs          state, connection life cycle, reconnection
+  connect.rs      connection screen, history, credential prompts
+  toolbar.rs      remote view, toolbar and menus
   viewer.rs       canvas rendering, keyboard/mouse input queue
   keysym.rs       KeyboardEvent → X11 keysym
   i18n.rs         FR/EN texts and error translation
+  prefs.rs        settings and history (localStorage)
   wire.rs         decoding of the backend's binary messages
 src-tauri/        Tauri application
-  src/rfb/        RFB client: handshake, auth, decoders, framebuffer
-  src/session.rs  TCP connection, read/write tasks, flow control
-  src/lib.rs      Tauri commands
+  src/rfb/        RFB client: handshake, security (VNC, ARD, VeNCrypt/TLS),
+                  decoders (including Tight), extended clipboard, framebuffer
+  src/ssh.rs      SSH tunnel
+  src/session.rs  connection, read/write tasks, flow control
+  src/lib.rs      Tauri commands (one session per window)
 ```
 
 The backend reports errors as language-neutral codes (`{code, detail}`); the UI
@@ -108,11 +133,23 @@ cargo test --workspace
 ```
 
 The backend tests play a full session against an in-memory fake VNC server
-(authentication, every encoding, cursor, clipboard, resize).
+(authentication, VeNCrypt/TLS, every encoding, cursor, classic and extended
+clipboard, resize).
+
+An extra test, ignored by default, connects to a real server; the parameters are
+those of the `connect` command, as JSON:
+
+```bash
+VNC_LIVE='{"host":"localhost","port":5901,"password":"secret","shared":true}' \
+  cargo test -p vncviewer live -- --ignored --nocapture
+```
 
 ## Limitations
 
-- No encryption (VeNCrypt/TLS) and no proprietary security types
-  (Apple ARD, RealVNC): use an SSH tunnel for non-local connections,
-  for example `ssh -L 5901:localhost:5901 server`, then connect to `localhost:1`.
-- Tight encoding is not supported (ZRLE is used instead).
+- Anonymous TLS (VeNCrypt TLSNone / TLSVnc / TLSPlain subtypes) is not supported:
+  when the server offers nothing else, the connection falls back to the other
+  (unencrypted) security types. Set up an X.509 certificate on the server, or use
+  the SSH tunnel.
+- RealVNC proprietary security types (RA2) are not supported.
+- SSH tunnel: keys protected by a passphrase go through the SSH agent; SSH host
+  certificates are not accepted.

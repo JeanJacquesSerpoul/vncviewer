@@ -9,6 +9,12 @@ pub const MSG_CURSOR: u8 = 2;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Event {
+    Connected {
+        security: String,
+        encrypted: bool,
+        tunnel: bool,
+    },
+    RemoteResize,
     Resize {
         width: u32,
         height: u32,
@@ -71,7 +77,7 @@ impl PixelBlock {
 
 fn block_at<B: Bytes + ?Sized>(b: &B, at: usize) -> Result<PixelBlock, String> {
     if at + 8 > b.len() {
-        return Err("en-tête de rectangle tronqué".into());
+        return Err("truncated rectangle header".into());
     }
     let block = PixelBlock {
         x: b.u16_at(at) as u32,
@@ -81,7 +87,7 @@ fn block_at<B: Bytes + ?Sized>(b: &B, at: usize) -> Result<PixelBlock, String> {
         offset: at + 8,
     };
     if block.offset + block.byte_len() > b.len() {
-        return Err("pixels tronqués".into());
+        return Err("truncated pixels".into());
     }
     Ok(block)
 }
@@ -89,7 +95,7 @@ fn block_at<B: Bytes + ?Sized>(b: &B, at: usize) -> Result<PixelBlock, String> {
 /// Rectangles of a `MSG_RECTS` message.
 pub fn rects<B: Bytes + ?Sized>(b: &B) -> Result<Vec<PixelBlock>, String> {
     if b.len() < 5 || b.u8_at(0) != MSG_RECTS {
-        return Err("message de rectangles invalide".into());
+        return Err("invalid rectangles message".into());
     }
     let count = b.u32_at(1) as usize;
     let mut out = Vec::with_capacity(count.min(1024));
@@ -105,7 +111,7 @@ pub fn rects<B: Bytes + ?Sized>(b: &B) -> Result<Vec<PixelBlock>, String> {
 /// Cursor of a `MSG_CURSOR` message: the block's x/y are the hotspot.
 pub fn cursor<B: Bytes + ?Sized>(b: &B) -> Result<PixelBlock, String> {
     if b.len() < 1 || b.u8_at(0) != MSG_CURSOR {
-        return Err("message de curseur invalide".into());
+        return Err("invalid cursor message".into());
     }
     block_at(b, 1)
 }
@@ -154,6 +160,19 @@ mod tests {
 
     #[test]
     fn parses_events() {
+        let ev: Event = serde_json::from_str(
+            r#"{"type":"connected","security":"x509Vnc","encrypted":true,"tunnel":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ev,
+            Event::Connected {
+                encrypted: true,
+                ..
+            }
+        ));
+        let ev: Event = serde_json::from_str(r#"{"type":"remoteResize"}"#).unwrap();
+        assert_eq!(ev, Event::RemoteResize);
         let ev: Event = serde_json::from_str(r#"{"type":"disconnected","reason":null}"#).unwrap();
         assert_eq!(ev, Event::Disconnected { reason: None });
         let ev: Event =

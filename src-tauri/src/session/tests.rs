@@ -886,12 +886,27 @@ async fn live_server() {
     let mut remote_resize = false;
     let mut resized = false;
     let mut pixels = false;
+    let mut img = vec![0u8; w as usize * h as usize * 4];
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while let Ok(Some(out)) = tokio::time::timeout_at(deadline, sink_rx.recv()).await {
         let Out::Msg(m) = out else { continue };
+        eprintln!("message kind {} ({} bytes)", m[0], m.len());
         match m[0] {
             MSG_RECTS => {
-                pixels = true;
+                if !resized {
+                    apply_rects(&m, &mut img, w as usize);
+                    let lit = img
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter(|p| p[..3] != [0, 0, 0])
+                        .count();
+                    eprintln!("frame: {lit} non-black pixels");
+                    pixels |= lit > 0;
+                    if pixels && remote_resize {
+                        session.set_desktop_size(w - 100, h - 100);
+                    }
+                }
                 session.frame_ack();
                 if resized {
                     break;
@@ -901,9 +916,8 @@ async fn live_server() {
                 let ev = event(&m);
                 eprintln!("{ev}");
                 assert_ne!(ev["type"], "disconnected");
-                if ev["type"] == "remoteResize" && !remote_resize {
+                if ev["type"] == "remoteResize" {
                     remote_resize = true;
-                    session.set_desktop_size(w - 100, h - 100);
                 }
                 if ev["type"] == "resize" {
                     assert_eq!(ev["width"], w - 100);
@@ -913,6 +927,6 @@ async fn live_server() {
             _ => {}
         }
     }
-    assert!(pixels, "no pixels received");
+    assert!(pixels, "no visible pixels received");
     eprintln!("remote resize supported: {remote_resize}");
 }
