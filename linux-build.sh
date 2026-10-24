@@ -6,8 +6,6 @@
 #   ./linux-build.sh --deps          installe d'abord les dépendances de compilation
 #   ./linux-build.sh --install       installe ensuite le paquet adapté au système
 #   ./linux-build.sh --bundles deb   ne construit que le .deb
-#
-# Pour compiler et installer sans paquet (dans ~/.local), voir ./install.sh.
 
 set -euo pipefail
 
@@ -239,7 +237,6 @@ if [[ $install -eq 1 ]]; then
     elif [[ -n "$appimage" ]]; then
         chmod +x "$appimage"
         warn "pas de paquet installable ici ; l'AppImage se lance directement : $appimage"
-        echo "  (ou ./install.sh pour une installation dans ~/.local)"
         exit 0
     else
         die "aucun paquet adapté à ce système n'a été produit (voir --bundles)"

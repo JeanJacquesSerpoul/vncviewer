@@ -96,24 +96,6 @@ trame avant que le backend ne demande la suivante (pas d'accumulation de latence
 - Sous Linux, les dépendances système de Tauri (WebKitGTK 4.1, etc.), voir
   <https://tauri.app/start/prerequisites/>
 
-## Compiler et installer sous Linux
-
-```bash
-./install.sh --deps
-```
-
-Le script compile l'application en mode release et l'installe dans `~/.local` :
-binaire `vnc-viewer` (nommé ainsi pour ne pas masquer le `vncviewer` de TigerVNC),
-entrée de menu et icônes. `--deps` installe d'abord les dépendances de compilation
-(apt, dnf ou pacman) et Rust s'il est absent ; inutile si elles sont déjà présentes.
-
-| Option | Effet |
-|---|---|
-| `--system` | installe pour tous les utilisateurs dans `/usr/local` (sudo) |
-| `--prefix DIR` | autre répertoire d'installation |
-| `--skip-build` | réinstalle le binaire déjà compilé |
-| `--uninstall` | désinstalle (avec les mêmes `--system` / `--prefix`) |
-
 ## Lancer en développement
 
 ```bash

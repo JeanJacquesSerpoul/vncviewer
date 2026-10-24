@@ -38,8 +38,8 @@ jobs:
       - name: Formatage
         run: cargo fmt --all --check
 
-      - name: Scripts d'installation
-        run: shellcheck install.sh linux-build.sh
+      - name: Script de construction Linux
+        run: shellcheck linux-build.sh
 
       # Also produces dist/, which `tauri::generate_context!` needs to compile.
       - name: Build de l'interface (wasm)
