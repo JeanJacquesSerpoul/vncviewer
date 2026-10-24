@@ -2,33 +2,64 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{Error, Result, auth};
+use super::security::{self, Security, SecurityOptions};
+use super::{BoxStream, Error, Result};
 
 pub mod encoding {
     pub const RAW: i32 = 0;
     pub const COPY_RECT: i32 = 1;
     pub const RRE: i32 = 2;
     pub const HEXTILE: i32 = 5;
+    pub const TIGHT: i32 = 7;
     pub const ZRLE: i32 = 16;
+    /// JPEG quality 0–9 (Tight): `QUALITY_0 + level`.
+    pub const QUALITY_0: i32 = -32;
+    /// zlib compression level 0–9 (Tight): `COMPRESSION_0 + level`.
+    pub const COMPRESSION_0: i32 = -256;
     pub const DESKTOP_SIZE: i32 = -223;
     pub const LAST_RECT: i32 = -224;
     pub const CURSOR: i32 = -239;
+    pub const EXTENDED_DESKTOP_SIZE: i32 = -308;
+    pub const EXTENDED_CLIPBOARD: i32 = 0xC0A1E5CEu32 as i32;
+}
+
+/// Image quality / bandwidth trade-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Quality {
+    /// Lossless: ZRLE first, Tight without JPEG.
+    #[default]
+    Lossless,
+    /// Tight with good JPEG quality.
+    High,
+    /// Tight with low JPEG quality and strong compression (slow links).
+    Low,
 }
 
 /// Encodings announced to the server, in order of preference.
-pub const ENCODINGS: &[i32] = &[
-    encoding::COPY_RECT,
-    encoding::ZRLE,
-    encoding::HEXTILE,
-    encoding::RRE,
-    encoding::RAW,
-    encoding::CURSOR,
-    encoding::DESKTOP_SIZE,
-    encoding::LAST_RECT,
-];
-
-const SECURITY_NONE: u8 = 1;
-const SECURITY_VNC_AUTH: u8 = 2;
+pub fn encodings(quality: Quality) -> Vec<i32> {
+    use encoding::*;
+    let mut v = vec![COPY_RECT];
+    match quality {
+        Quality::Lossless => v.extend([ZRLE, TIGHT]),
+        Quality::High | Quality::Low => v.extend([TIGHT, ZRLE]),
+    }
+    v.extend([HEXTILE, RRE, RAW]);
+    match quality {
+        // No quality level: Tight stays lossless.
+        Quality::Lossless => v.push(COMPRESSION_0 + 2),
+        Quality::High => v.extend([QUALITY_0 + 8, COMPRESSION_0 + 2]),
+        Quality::Low => v.extend([QUALITY_0 + 3, COMPRESSION_0 + 9]),
+    }
+    v.extend([
+        CURSOR,
+        EXTENDED_DESKTOP_SIZE,
+        DESKTOP_SIZE,
+        LAST_RECT,
+        EXTENDED_CLIPBOARD,
+    ]);
+    v
+}
 
 const MAX_STRING: u32 = 1 << 20;
 
@@ -102,57 +133,37 @@ pub struct ServerInit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Version {
+pub(crate) enum Version {
     V3_3,
     V3_7,
     V3_8,
 }
 
-/// Runs the RFB handshake up to and including ServerInit.
-pub async fn handshake<S>(
-    stream: &mut S,
-    password: Option<&str>,
+/// Runs the RFB handshake up to and including ServerInit. Returns the stream
+/// to continue on (it may now be wrapped in TLS) and the security in effect.
+pub async fn handshake(
+    mut stream: BoxStream,
+    opts: &SecurityOptions,
     shared: bool,
-) -> Result<ServerInit>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let version = negotiate_version(stream).await?;
-    let security = choose_security(stream, version, password).await?;
-
-    if security == SECURITY_VNC_AUTH {
-        let password = password.ok_or(Error::PasswordRequired)?;
-        let mut challenge = [0u8; 16];
-        stream.read_exact(&mut challenge).await?;
-        stream
-            .write_all(&auth::challenge_response(password, &challenge))
-            .await?;
-    }
-
-    // RFB 3.8 always sends a SecurityResult; older versions only after VNC auth.
-    if (version == Version::V3_8 || security == SECURITY_VNC_AUTH) && stream.read_u32().await? != 0
-    {
-        let reason = if version == Version::V3_8 {
-            Some(read_string(stream).await?).filter(|r| !r.is_empty())
-        } else {
-            None
-        };
-        return Err(Error::AuthFailed(reason));
-    }
+) -> Result<(BoxStream, ServerInit, Security)> {
+    let version = negotiate_version(&mut stream).await?;
+    let (mut stream, security) = security::negotiate(stream, version, opts).await?;
 
     stream.write_u8(shared as u8).await?;
+    stream.flush().await?;
 
     let width = stream.read_u16().await?;
     let height = stream.read_u16().await?;
     let mut pf = [0u8; 16];
     stream.read_exact(&mut pf).await?;
-    let name = read_string(stream).await?;
-    Ok(ServerInit {
+    let name = read_string(&mut stream).await?;
+    let init = ServerInit {
         width,
         height,
         pixel_format: PixelFormat::from_bytes(&pf),
         name,
-    })
+    };
+    Ok((stream, init, security))
 }
 
 async fn negotiate_version<S>(stream: &mut S) -> Result<Version>
@@ -181,44 +192,8 @@ where
         Version::V3_8 => b"RFB 003.008\n",
     };
     stream.write_all(reply).await?;
+    stream.flush().await?;
     Ok(version)
-}
-
-async fn choose_security<S>(stream: &mut S, version: Version, password: Option<&str>) -> Result<u8>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    if version == Version::V3_3 {
-        // The server imposes the security type.
-        return match stream.read_u32().await? {
-            0 => Err(Error::Server(read_string(stream).await?)),
-            t @ (1 | 2) => Ok(t as u8),
-            t => Err(Error::UnsupportedSecurity(vec![t])),
-        };
-    }
-
-    let count = stream.read_u8().await?;
-    if count == 0 {
-        return Err(Error::Server(read_string(stream).await?));
-    }
-    let mut types = vec![0u8; count as usize];
-    stream.read_exact(&mut types).await?;
-
-    let offers = |t| types.contains(&t);
-    let chosen = if offers(SECURITY_VNC_AUTH) && (password.is_some() || !offers(SECURITY_NONE)) {
-        SECURITY_VNC_AUTH
-    } else if offers(SECURITY_NONE) {
-        SECURITY_NONE
-    } else {
-        return Err(Error::UnsupportedSecurity(
-            types.iter().map(|&t| t as u32).collect(),
-        ));
-    };
-    if chosen == SECURITY_VNC_AUTH && password.is_none() {
-        return Err(Error::PasswordRequired);
-    }
-    stream.write_u8(chosen).await?;
-    Ok(chosen)
 }
 
 pub(crate) async fn read_string<R: AsyncRead + Unpin>(r: &mut R) -> Result<String> {
@@ -280,6 +255,20 @@ pub fn pointer_event(mask: u8, x: u16, y: u16) -> Vec<u8> {
     m
 }
 
+/// Asks the server to resize its desktop (ExtendedDesktopSize), as one screen.
+pub fn set_desktop_size(w: u16, h: u16, screen_id: u32) -> Vec<u8> {
+    let mut m = vec![251, 0];
+    m.extend_from_slice(&w.to_be_bytes());
+    m.extend_from_slice(&h.to_be_bytes());
+    m.extend_from_slice(&[1, 0]);
+    m.extend_from_slice(&screen_id.to_be_bytes());
+    for v in [0, 0, w, h] {
+        m.extend_from_slice(&v.to_be_bytes());
+    }
+    m.extend_from_slice(&0u32.to_be_bytes());
+    m
+}
+
 pub fn client_cut_text(text: &str) -> Vec<u8> {
     let bytes = latin1_encode(text);
     let mut m = vec![6, 0, 0, 0];
@@ -291,6 +280,15 @@ pub fn client_cut_text(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rfb::security::VNC_AUTH;
+
+    fn opts(password: Option<&str>) -> SecurityOptions {
+        SecurityOptions {
+            password: password.map(Into::into),
+            allow_vencrypt: true,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn pixel_format_roundtrip() {
@@ -308,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn rfb33_without_auth() {
-        let (mut client, mut server) = tokio::io::duplex(1024);
+        let (client, mut server) = tokio::io::duplex(1024);
         let srv = tokio::spawn(async move {
             server.write_all(b"RFB 003.003\n").await.unwrap();
             let mut v = [0u8; 12];
@@ -324,7 +322,10 @@ mod tests {
             server.write_u32(3).await.unwrap();
             server.write_all(b"old").await.unwrap();
         });
-        let init = handshake(&mut client, None, false).await.unwrap();
+        let (_, init, security) = handshake(Box::new(client), &opts(None), false)
+            .await
+            .unwrap();
+        assert_eq!(security, Security::None);
         srv.await.unwrap();
         assert_eq!(
             (init.width, init.height, init.name.as_str()),
@@ -334,13 +335,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_failure_reports_reason() {
-        let (mut client, mut server) = tokio::io::duplex(1024);
+        let (client, mut server) = tokio::io::duplex(1024);
         tokio::spawn(async move {
             server.write_all(b"RFB 003.008\n").await.unwrap();
             let mut v = [0u8; 12];
             server.read_exact(&mut v).await.unwrap();
-            server.write_all(&[1, SECURITY_VNC_AUTH]).await.unwrap();
-            assert_eq!(server.read_u8().await.unwrap(), SECURITY_VNC_AUTH);
+            server.write_all(&[1, VNC_AUTH as u8]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), VNC_AUTH as u8);
             server.write_all(&[7u8; 16]).await.unwrap();
             let mut resp = [0u8; 16];
             server.read_exact(&mut resp).await.unwrap();
@@ -348,9 +349,10 @@ mod tests {
             server.write_u32(5).await.unwrap();
             server.write_all(b"nope!").await.unwrap();
         });
-        let err = handshake(&mut client, Some("secret"), true)
+        let err = handshake(Box::new(client), &opts(Some("secret")), true)
             .await
-            .unwrap_err();
+            .err()
+            .unwrap();
         assert!(
             matches!(err, Error::AuthFailed(Some(ref r)) if r == "nope!"),
             "{err:?}"
@@ -359,15 +361,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_password_is_reported() {
-        let (mut client, mut server) = tokio::io::duplex(1024);
+        let (client, mut server) = tokio::io::duplex(1024);
         tokio::spawn(async move {
             server.write_all(b"RFB 003.008\n").await.unwrap();
             let mut v = [0u8; 12];
             server.read_exact(&mut v).await.unwrap();
-            server.write_all(&[1, SECURITY_VNC_AUTH]).await.unwrap();
+            server.write_all(&[1, VNC_AUTH as u8]).await.unwrap();
             let _ = server.read_u8().await;
         });
-        let err = handshake(&mut client, None, true).await.unwrap_err();
+        let err = handshake(Box::new(client), &opts(None), true)
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, Error::PasswordRequired), "{err:?}");
     }
 }

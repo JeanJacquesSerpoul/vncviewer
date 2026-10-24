@@ -61,10 +61,28 @@ impl Model {
 enum ClientMsg {
     SetPixelFormat(PixelFormat),
     SetEncodings(Vec<i32>),
-    UpdateRequest { incremental: bool, w: u16, h: u16 },
-    Key { down: bool, keysym: u32 },
-    Pointer { mask: u8, x: u16, y: u16 },
+    UpdateRequest {
+        incremental: bool,
+        w: u16,
+        h: u16,
+    },
+    Key {
+        down: bool,
+        keysym: u32,
+    },
+    Pointer {
+        mask: u8,
+        x: u16,
+        y: u16,
+    },
     CutText(Vec<u8>),
+    /// Extended clipboard message: flags and the rest of the payload.
+    ExtendedCut(u32, Vec<u8>),
+    SetDesktopSize {
+        w: u16,
+        h: u16,
+        screen_id: u32,
+    },
 }
 
 async fn read_client_messages(
@@ -112,9 +130,25 @@ async fn read_client_messages(
             6 => {
                 let mut pad = [0u8; 3];
                 rd.read_exact(&mut pad).await.unwrap();
-                let mut v = vec![0u8; rd.read_u32().await.unwrap() as usize];
+                let len = rd.read_i32().await.unwrap();
+                let mut v = vec![0u8; len.unsigned_abs() as usize];
                 rd.read_exact(&mut v).await.unwrap();
-                ClientMsg::CutText(v)
+                if len < 0 {
+                    let flags = u32::from_be_bytes(v[..4].try_into().unwrap());
+                    ClientMsg::ExtendedCut(flags, v[4..].to_vec())
+                } else {
+                    ClientMsg::CutText(v)
+                }
+            }
+            251 => {
+                rd.read_u8().await.unwrap();
+                let (w, h) = (rd.read_u16().await.unwrap(), rd.read_u16().await.unwrap());
+                assert_eq!(rd.read_u8().await.unwrap(), 1, "one screen");
+                rd.read_u8().await.unwrap();
+                let screen_id = rd.read_u32().await.unwrap();
+                let mut rest = [0u8; 12];
+                rd.read_exact(&mut rest).await.unwrap();
+                ClientMsg::SetDesktopSize { w, h, screen_id }
             }
             t => panic!("unexpected client message {t}"),
         };
@@ -380,7 +414,12 @@ async fn full_session_against_scripted_server() {
     });
 
     let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
-    let session = Session::start(client, Some("pass"), true, TestSink(sink_tx))
+    let opts = SecurityOptions {
+        password: Some("pass".into()),
+        allow_vencrypt: true,
+        ..Default::default()
+    };
+    let session = Session::start(Box::new(client), &opts, true, TestSink(sink_tx))
         .await
         .unwrap();
     let (srv_rd, mut srv_wr) = handshake.await.unwrap();
@@ -393,7 +432,7 @@ async fn full_session_against_scripted_server() {
     );
     assert_eq!(
         cmsgs.recv().await.unwrap(),
-        ClientMsg::SetEncodings(proto::ENCODINGS.to_vec())
+        ClientMsg::SetEncodings(proto::encodings(Quality::Lossless))
     );
     assert_eq!(
         cmsgs.recv().await.unwrap(),
@@ -404,6 +443,10 @@ async fn full_session_against_scripted_server() {
         }
     );
 
+    assert_eq!(
+        event(&next_msg(&mut sink_rx).await),
+        serde_json::json!({"type": "connected", "security": "vnc", "encrypted": false, "tunnel": false})
+    );
     let ev = event(&next_msg(&mut sink_rx).await);
     assert_eq!(
         ev,
@@ -536,4 +579,340 @@ fn many_rects_are_merged_into_a_bounding_box() {
     assert_eq!(u32::from_le_bytes(msg[1..5].try_into().unwrap()), 1);
     assert_eq!(&msg[5..13], &[0, 0, 0, 0, 100, 0, 100, 0]);
     assert_eq!(msg.len(), 13 + 100 * 100 * 4);
+}
+
+/// Server side of an RFB 3.8 handshake without authentication.
+async fn serve_handshake(
+    mut srv_rd: ReadHalf<DuplexStream>,
+    mut srv_wr: tokio::io::WriteHalf<DuplexStream>,
+) -> (ReadHalf<DuplexStream>, tokio::io::WriteHalf<DuplexStream>) {
+    srv_wr.write_all(b"RFB 003.008\n").await.unwrap();
+    let mut v = [0u8; 12];
+    srv_rd.read_exact(&mut v).await.unwrap();
+    srv_wr.write_all(&[1, 1]).await.unwrap();
+    assert_eq!(srv_rd.read_u8().await.unwrap(), 1);
+    srv_wr.write_u32(0).await.unwrap();
+    srv_rd.read_u8().await.unwrap();
+    srv_wr.write_all(&[0, W as u8, 0, H as u8]).await.unwrap();
+    srv_wr
+        .write_all(&PixelFormat::RGBX.to_bytes())
+        .await
+        .unwrap();
+    srv_wr.write_u32(1).await.unwrap();
+    srv_wr.write_all(b"x").await.unwrap();
+    (srv_rd, srv_wr)
+}
+
+/// Payload of a server extended clipboard message.
+fn server_extended_cut(flags: u32, data: &[u8]) -> Vec<u8> {
+    let mut w = Wire::default();
+    w.u8(3)
+        .bytes(&[0, 0, 0])
+        .bytes(&(-((4 + data.len()) as i32)).to_be_bytes())
+        .u32(flags)
+        .bytes(data);
+    w.0
+}
+
+#[tokio::test]
+async fn extended_clipboard_and_remote_resize() {
+    use crate::rfb::clipboard as xc;
+
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (srv_rd, srv_wr) = tokio::io::split(server);
+    let handshake = tokio::spawn(serve_handshake(srv_rd, srv_wr));
+    let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+    let session = Session::start(
+        Box::new(client),
+        &SecurityOptions::default(),
+        true,
+        TestSink(sink_tx),
+    )
+    .await
+    .unwrap();
+    let (srv_rd, mut srv_wr) = handshake.await.unwrap();
+    let (cmsg_tx, mut cmsgs) = mpsc::unbounded_channel();
+    tokio::spawn(read_client_messages(srv_rd, cmsg_tx));
+    for _ in 0..3 {
+        cmsgs.recv().await.unwrap(); // pixel format, encodings, full refresh
+    }
+    assert_eq!(event(&next_msg(&mut sink_rx).await)["type"], "connected");
+    assert_eq!(event(&next_msg(&mut sink_rx).await)["type"], "resize");
+
+    // Without the extension, the legacy (Latin-1) message is used.
+    session.send_cut_text("a");
+    assert_eq!(
+        cmsgs.recv().await.unwrap(),
+        ClientMsg::CutText(b"a".to_vec())
+    );
+
+    // The server announces the extension; the client answers with its caps.
+    srv_wr
+        .write_all(&server_extended_cut(
+            xc::CAPS | xc::TEXT,
+            &xc::MAX_TEXT.to_be_bytes(),
+        ))
+        .await
+        .unwrap();
+    match cmsgs.recv().await.unwrap() {
+        ClientMsg::ExtendedCut(flags, _) => assert_ne!(flags & xc::CAPS, 0),
+        m => panic!("expected caps, got {m:?}"),
+    }
+
+    // Local text: notify, then provide on request.
+    session.send_cut_text("€ 🎉");
+    assert_eq!(
+        cmsgs.recv().await.unwrap(),
+        ClientMsg::ExtendedCut(xc::NOTIFY | xc::TEXT, vec![])
+    );
+    srv_wr
+        .write_all(&server_extended_cut(xc::REQUEST | xc::TEXT, &[]))
+        .await
+        .unwrap();
+    let ClientMsg::ExtendedCut(flags, data) = cmsgs.recv().await.unwrap() else {
+        panic!("expected provide");
+    };
+    let mut all = flags.to_be_bytes().to_vec();
+    all.extend(data);
+    assert_eq!(
+        xc::parse(&all).unwrap(),
+        xc::Message::Provide(Some("€ 🎉".into()))
+    );
+
+    // Remote text: notify -> the client requests -> provide reaches the sink.
+    srv_wr
+        .write_all(&server_extended_cut(xc::NOTIFY | xc::TEXT, &[]))
+        .await
+        .unwrap();
+    assert_eq!(
+        cmsgs.recv().await.unwrap(),
+        ClientMsg::ExtendedCut(xc::REQUEST | xc::TEXT, vec![])
+    );
+    let provide = xc::provide_text("ok\nUTF-8 ✓");
+    srv_wr
+        .write_all(&server_extended_cut(
+            u32::from_be_bytes(provide[8..12].try_into().unwrap()),
+            &provide[12..],
+        ))
+        .await
+        .unwrap();
+    match sink_rx.recv().await.unwrap() {
+        Out::Cut(t) => assert_eq!(t, "ok\nUTF-8 ✓"),
+        Out::Msg(m) => panic!("expected cut text, got {m:?}"),
+    }
+
+    // No ExtendedDesktopSize yet: resize requests are dropped.
+    session.set_desktop_size(10, 10);
+    // The server reports its layout (same size, screen id 7)...
+    let mut w = Wire::default();
+    w.u8(0).u8(0).u16(1);
+    w.rect(0, 0, W, H, encoding::EXTENDED_DESKTOP_SIZE)
+        .u8(1)
+        .bytes(&[0, 0, 0])
+        .u32(7)
+        .u16(0)
+        .u16(0)
+        .u16(W)
+        .u16(H)
+        .u32(0);
+    srv_wr.write_all(&w.0).await.unwrap();
+    assert_eq!(
+        event(&next_msg(&mut sink_rx).await),
+        serde_json::json!({"type": "remoteResize"})
+    );
+    assert!(matches!(
+        cmsgs.recv().await.unwrap(),
+        ClientMsg::UpdateRequest {
+            incremental: true,
+            ..
+        }
+    ));
+    // ...then resize requests go out with its screen id.
+    session.set_desktop_size(100, 50);
+    assert_eq!(
+        cmsgs.recv().await.unwrap(),
+        ClientMsg::SetDesktopSize {
+            w: 100,
+            h: 50,
+            screen_id: 7
+        }
+    );
+    // The server applies it: the framebuffer follows.
+    let mut w = Wire::default();
+    w.u8(0).u8(0).u16(1);
+    w.rect(1, 0, 100, 50, encoding::EXTENDED_DESKTOP_SIZE)
+        .u8(1)
+        .bytes(&[0, 0, 0])
+        .u32(7)
+        .u16(0)
+        .u16(0)
+        .u16(100)
+        .u16(50)
+        .u32(0);
+    srv_wr.write_all(&w.0).await.unwrap();
+    assert_eq!(
+        event(&next_msg(&mut sink_rx).await),
+        serde_json::json!({"type": "resize", "width": 100, "height": 50, "name": "x"})
+    );
+}
+
+#[tokio::test]
+async fn vencrypt_x509_with_certificate_pinning() {
+    use std::sync::Arc;
+
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    use crate::rfb::security::{VENCRYPT, vencrypt};
+    use crate::rfb::{Error, tls};
+
+    let cert = rcgen::generate_simple_self_signed(vec!["vnc.test".into()]).unwrap();
+    let der = cert.cert.der().clone();
+    let fp = tls::fingerprint(&der);
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let config = ServerConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![der], key)
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
+    // Server: VeNCrypt 0.2 offering X509Vnc, then VNC auth inside TLS.
+    let serve = |acceptor: TlsAcceptor, server: DuplexStream| async move {
+        let mut s = server;
+        s.write_all(b"RFB 003.008\n").await.unwrap();
+        let mut v = [0u8; 12];
+        s.read_exact(&mut v).await.unwrap();
+        s.write_all(&[1, VENCRYPT as u8]).await.unwrap();
+        assert_eq!(s.read_u8().await.unwrap(), VENCRYPT as u8);
+        s.write_all(&[0, 2]).await.unwrap();
+        let mut ver = [0u8; 2];
+        s.read_exact(&mut ver).await.unwrap();
+        assert_eq!(ver, [0, 2]);
+        s.write_all(&[0, 2]).await.unwrap(); // OK, 2 subtypes
+        s.write_u32(vencrypt::TLS_VNC).await.unwrap();
+        s.write_u32(vencrypt::X509_VNC).await.unwrap();
+        assert_eq!(s.read_u32().await.unwrap(), vencrypt::X509_VNC);
+        s.write_u8(1).await.unwrap();
+        let Ok(mut tls) = acceptor.accept(s).await else {
+            return None; // the client refused the certificate
+        };
+        let challenge = [3u8; 16];
+        tls.write_all(&challenge).await.unwrap();
+        let mut resp = [0u8; 16];
+        tls.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, auth::challenge_response("pw", &challenge));
+        tls.write_u32(0).await.unwrap();
+        assert_eq!(tls.read_u8().await.unwrap(), 0, "exclusive");
+        tls.write_all(&[0, 4, 0, 4]).await.unwrap();
+        tls.write_all(&PixelFormat::RGBX.to_bytes()).await.unwrap();
+        tls.write_u32(3).await.unwrap();
+        tls.write_all(b"tls").await.unwrap();
+        tls.flush().await.unwrap();
+        Some(tls)
+    };
+    let mut opts = SecurityOptions {
+        password: Some("pw".into()),
+        host: "vnc.test".into(),
+        allow_vencrypt: true,
+        ..Default::default()
+    };
+
+    // Self-signed and not trusted yet: refused, with its fingerprint.
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(serve(acceptor.clone(), server));
+    let err = rfb::handshake(Box::new(client), &opts, false)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, Error::UntrustedCertificate(f) if *f == fp),
+        "{err:?}"
+    );
+    srv.abort();
+
+    // Once trusted, the session is encrypted.
+    opts.trusted_cert = Some(fp);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(serve(acceptor, server));
+    let (_stream, init, security) = rfb::handshake(Box::new(client), &opts, false)
+        .await
+        .unwrap();
+    assert_eq!(security, Security::X509Vnc);
+    assert!(security.encrypted());
+    assert_eq!((init.width, init.name.as_str()), (4, "tls"));
+    drop(srv);
+}
+
+/// Against a real server, e.g.
+/// `VNC_LIVE='{"host":"localhost","port":5901,"password":"secret","shared":true}'
+/// cargo test -p vncviewer live -- --ignored --nocapture`.
+/// An untrusted certificate or SSH host key is accepted (and reported).
+#[tokio::test]
+#[ignore]
+async fn live_server() {
+    let Ok(json) = std::env::var("VNC_LIVE") else {
+        panic!("set VNC_LIVE to the connection parameters (JSON)");
+    };
+    let mut params: ConnectParams = serde_json::from_str(&json).unwrap();
+    let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+    let session = loop {
+        match Session::connect(&params, TestSink(sink_tx.clone())).await {
+            Ok(s) => break s,
+            Err(rfb::Error::UntrustedCertificate(fp)) => {
+                eprintln!("trusting certificate {fp}");
+                params.trusted_cert = Some(fp);
+            }
+            Err(rfb::Error::SshHostKeyUnknown(fp)) => {
+                eprintln!("trusting SSH host key {fp}");
+                params.ssh.as_mut().unwrap().trusted_key = Some(fp);
+            }
+            Err(e) => panic!("connection failed: {e}"),
+        }
+    };
+    let connected = event(&next_msg(&mut sink_rx).await);
+    eprintln!("{connected}");
+    let resize = event(&next_msg(&mut sink_rx).await);
+    eprintln!("{resize}");
+    assert_eq!(resize["type"], "resize");
+    let (w, h) = (
+        resize["width"].as_u64().unwrap() as u16,
+        resize["height"].as_u64().unwrap() as u16,
+    );
+    let mut remote_resize = false;
+    let mut resized = false;
+    let mut pixels = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(Some(out)) = tokio::time::timeout_at(deadline, sink_rx.recv()).await {
+        let Out::Msg(m) = out else { continue };
+        match m[0] {
+            MSG_RECTS => {
+                pixels = true;
+                session.frame_ack();
+                if resized {
+                    break;
+                }
+            }
+            MSG_EVENT => {
+                let ev = event(&m);
+                eprintln!("{ev}");
+                assert_ne!(ev["type"], "disconnected");
+                if ev["type"] == "remoteResize" && !remote_resize {
+                    remote_resize = true;
+                    session.set_desktop_size(w - 100, h - 100);
+                }
+                if ev["type"] == "resize" {
+                    assert_eq!(ev["width"], w - 100);
+                    resized = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(pixels, "no pixels received");
+    eprintln!("remote resize supported: {remote_resize}");
 }

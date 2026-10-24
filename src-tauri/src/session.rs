@@ -9,8 +9,8 @@
 //!   followed by `w*h*4` RGBA bytes.
 //! * `2` — cursor shape: `u16` hot x, hot y, w, h, then `w*h*4` RGBA bytes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -19,13 +19,19 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::rfb::{self, CursorShape, Decoder, Framebuffer, Rect, ServerInit, ServerMessage, proto};
+use crate::rfb::clipboard::{self as xclip, Message as ClipMessage};
+use crate::rfb::proto::Quality;
+use crate::rfb::{
+    self, BoxStream, CursorShape, Decoder, Framebuffer, Rect, Security, SecurityOptions,
+    ServerInit, ServerMessage, proto,
+};
+use crate::ssh::{self, SshParams};
 
 pub const MSG_EVENT: u8 = 0;
 pub const MSG_RECTS: u8 = 1;
 pub const MSG_CURSOR: u8 = 2;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to wait for the UI to draw a frame before asking for the next one.
 const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// Above this many rectangles, a single bounding box is sent instead.
@@ -37,9 +43,38 @@ pub trait Sink: Send + Sync + 'static {
     fn cut_text(&self, text: String);
 }
 
+/// Everything needed to open a session, as sent by the UI.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectParams {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    pub shared: bool,
+    /// SHA-256 fingerprint of a TLS certificate the user chose to trust.
+    #[serde(default)]
+    pub trusted_cert: Option<String>,
+    #[serde(default)]
+    pub quality: Quality,
+    #[serde(default)]
+    pub ssh: Option<SshParams>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Event {
+    /// Sent once, before the first `resize`.
+    Connected {
+        security: Security,
+        /// The whole session is encrypted (TLS or SSH tunnel).
+        encrypted: bool,
+        tunnel: bool,
+    },
+    /// The server can change its desktop size on request.
+    RemoteResize,
     Resize {
         width: u16,
         height: u16,
@@ -64,9 +99,21 @@ enum Outgoing {
     FullRefresh,
 }
 
+/// State shared by the session handle and its reader task.
+#[derive(Default)]
+struct Shared {
+    /// The server supports the extended clipboard for text.
+    extended_clipboard: bool,
+    /// Local clipboard text announced to the server, provided on request.
+    local_text: Option<String>,
+    /// Screen id from ExtendedDesktopSize, once the server announced it.
+    screen_id: Option<u32>,
+}
+
 pub struct Session {
     out: mpsc::UnboundedSender<Outgoing>,
     ack: Arc<Notify>,
+    shared: Arc<Mutex<Shared>>,
     tasks: [JoinHandle<()>; 2],
 }
 
@@ -79,52 +126,94 @@ impl Drop for Session {
 }
 
 impl Session {
-    /// Opens a TCP connection, performs the handshake and starts the session.
-    pub async fn connect<S: Sink>(
-        host: &str,
-        port: u16,
-        password: Option<&str>,
-        shared: bool,
-        sink: S,
-    ) -> rfb::Result<Session> {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+    /// Opens the connection (directly or through SSH), performs the handshake
+    /// and starts the session.
+    pub async fn connect<S: Sink>(p: &ConnectParams, sink: S) -> rfb::Result<Session> {
+        let mut opts = SecurityOptions {
+            username: p.username.clone().filter(|u| !u.is_empty()),
+            password: p.password.clone().filter(|p| !p.is_empty()),
+            host: p.host.clone(),
+            trusted_cert: p.trusted_cert.clone(),
+            allow_vencrypt: true,
+        };
+        let attempt = async {
+            loop {
+                let stream = open(p).await?;
+                match rfb::handshake(stream, &opts, p.shared).await {
+                    // Only anonymous TLS offered: retry with the other types.
+                    Err(rfb::Error::VencryptUnusable(subtypes)) if opts.allow_vencrypt => {
+                        log::info!("VeNCrypt unusable ({subtypes:?}), retrying without it");
+                        opts.allow_vencrypt = false;
+                    }
+                    r => return r,
+                }
+            }
+        };
+        let (stream, init, security) = tokio::time::timeout(CONNECT_TIMEOUT, attempt)
             .await
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
-        stream.set_nodelay(true)?;
-        tokio::time::timeout(CONNECT_TIMEOUT, Self::start(stream, password, shared, sink))
-            .await
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+        Ok(Self::run(
+            stream,
+            init,
+            security,
+            p.ssh.is_some(),
+            p.quality,
+            sink,
+        ))
     }
 
     /// Performs the handshake on an established stream and starts the session.
-    pub async fn start<T, S>(
-        mut stream: T,
-        password: Option<&str>,
+    #[cfg(test)]
+    pub async fn start<S: Sink>(
+        stream: BoxStream,
+        opts: &SecurityOptions,
         shared: bool,
         sink: S,
-    ) -> rfb::Result<Session>
-    where
-        T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-        S: Sink,
-    {
-        let init = rfb::handshake(&mut stream, password, shared).await?;
+    ) -> rfb::Result<Session> {
+        let (stream, init, security) = rfb::handshake(stream, opts, shared).await?;
+        Ok(Self::run(
+            stream,
+            init,
+            security,
+            false,
+            Quality::Lossless,
+            sink,
+        ))
+    }
+
+    fn run<S: Sink>(
+        stream: BoxStream,
+        init: ServerInit,
+        security: Security,
+        tunnel: bool,
+        quality: Quality,
+        sink: S,
+    ) -> Session {
         log::info!(
-            "connected to {:?} ({}×{}), server pixel format {:?}",
+            "connected to {:?} ({}×{}), security {security:?}, server pixel format {:?}",
             init.name,
             init.width,
             init.height,
             init.pixel_format
         );
+        sink.message(encode_event(&Event::Connected {
+            security,
+            encrypted: tunnel || security.encrypted(),
+            tunnel,
+        }));
 
         let (rd, wr) = tokio::io::split(stream);
         let (out, rx) = mpsc::unbounded_channel();
         let ack = Arc::new(Notify::new());
+        let shared = Arc::new(Mutex::new(Shared::default()));
         let size = Arc::new(AtomicU32::new(pack_size(init.width, init.height)));
 
         let _ = out.send(Outgoing::Bytes(proto::set_pixel_format(
             &proto::PixelFormat::RGBX,
         )));
-        let _ = out.send(Outgoing::Bytes(proto::set_encodings(proto::ENCODINGS)));
+        let _ = out.send(Outgoing::Bytes(proto::set_encodings(&proto::encodings(
+            quality,
+        ))));
         let _ = out.send(Outgoing::FullRefresh);
 
         let writer = tokio::spawn(writer_loop(wr, rx, size.clone()));
@@ -132,15 +221,19 @@ impl Session {
             BufReader::with_capacity(1 << 18, rd),
             init,
             sink,
-            out.clone(),
-            ack.clone(),
-            size,
+            Channels {
+                out: out.clone(),
+                ack: ack.clone(),
+                shared: shared.clone(),
+                size,
+            },
         ));
-        Ok(Session {
+        Session {
             out,
             ack,
+            shared,
             tasks: [reader, writer],
-        })
+        }
     }
 
     pub fn input(&self, events: &[InputEvent]) {
@@ -154,7 +247,24 @@ impl Session {
     }
 
     pub fn send_cut_text(&self, text: &str) {
-        let _ = self.out.send(Outgoing::Bytes(proto::client_cut_text(text)));
+        let mut shared = self.shared.lock().unwrap();
+        let msg = if shared.extended_clipboard {
+            // Announce it; the server asks for the content when it wants it.
+            shared.local_text = Some(text.to_owned());
+            xclip::notify(true)
+        } else {
+            proto::client_cut_text(text)
+        };
+        let _ = self.out.send(Outgoing::Bytes(msg));
+    }
+
+    /// Asks the server to resize its desktop, if it supports it.
+    pub fn set_desktop_size(&self, width: u16, height: u16) {
+        if let Some(id) = self.shared.lock().unwrap().screen_id {
+            let _ = self
+                .out
+                .send(Outgoing::Bytes(proto::set_desktop_size(width, height, id)));
+        }
     }
 
     /// Asks the server to resend the whole screen.
@@ -202,14 +312,24 @@ where
     }
 }
 
-async fn reader_loop<R, S>(
-    mut rd: R,
-    init: ServerInit,
-    sink: S,
+/// What the reader task shares with the rest of the session.
+struct Channels {
     out: mpsc::UnboundedSender<Outgoing>,
     ack: Arc<Notify>,
+    shared: Arc<Mutex<Shared>>,
     size: Arc<AtomicU32>,
-) where
+}
+
+impl Channels {
+    fn send(&self, bytes: Vec<u8>) -> rfb::Result<()> {
+        self.out
+            .send(Outgoing::Bytes(bytes))
+            .map_err(|_| rfb::Error::ConnectionLost)
+    }
+}
+
+async fn reader_loop<R, S>(mut rd: R, init: ServerInit, sink: S, ch: Channels)
+where
     R: AsyncRead + Unpin,
     S: Sink,
 {
@@ -225,8 +345,24 @@ async fn reader_loop<R, S>(
         loop {
             match decoder.read_message(&mut rd, &mut fb).await? {
                 ServerMessage::FramebufferUpdate(update) => {
+                    if let Some(layout) = update.desktop {
+                        let first = ch
+                            .shared
+                            .lock()
+                            .unwrap()
+                            .screen_id
+                            .replace(layout.screen_id)
+                            .is_none();
+                        if first {
+                            sink.message(encode_event(&Event::RemoteResize));
+                        }
+                        if layout.reason == 1 && layout.status != 0 {
+                            log::info!("desktop resize refused (status {})", layout.status);
+                        }
+                    }
                     if update.resized {
-                        size.store(pack_size(fb.width(), fb.height()), Ordering::Relaxed);
+                        ch.size
+                            .store(pack_size(fb.width(), fb.height()), Ordering::Relaxed);
                         sink.message(encode_event(&Event::Resize {
                             width: fb.width(),
                             height: fb.height(),
@@ -239,17 +375,18 @@ async fn reader_loop<R, S>(
                     if !update.dirty.is_empty() {
                         sink.message(encode_rects(&fb, &update.dirty));
                         // Flow control: don't outrun the UI.
-                        let _ = tokio::time::timeout(ACK_TIMEOUT, ack.notified()).await;
+                        let _ = tokio::time::timeout(ACK_TIMEOUT, ch.ack.notified()).await;
                     }
                     let next = if update.resized {
                         Outgoing::FullRefresh
                     } else {
                         Outgoing::Bytes(proto::update_request(true, 0, 0, fb.width(), fb.height()))
                     };
-                    out.send(next).map_err(|_| rfb::Error::ConnectionLost)?;
+                    ch.out.send(next).map_err(|_| rfb::Error::ConnectionLost)?;
                 }
                 ServerMessage::Bell => sink.message(encode_event(&Event::Bell)),
                 ServerMessage::CutText(text) => sink.cut_text(text),
+                ServerMessage::Clipboard(msg) => handle_clipboard(msg, &sink, &ch)?,
                 ServerMessage::SetColourMap => {}
             }
         }
@@ -260,6 +397,42 @@ async fn reader_loop<R, S>(
         e.info()
     });
     sink.message(encode_event(&Event::Disconnected { reason }));
+}
+
+fn handle_clipboard<S: Sink>(msg: ClipMessage, sink: &S, ch: &Channels) -> rfb::Result<()> {
+    match msg {
+        ClipMessage::Caps { text } => {
+            ch.shared.lock().unwrap().extended_clipboard = text;
+            if text {
+                ch.send(xclip::caps())?;
+            }
+        }
+        ClipMessage::Notify { text: true } => ch.send(xclip::request_text())?,
+        ClipMessage::Notify { text: false } | ClipMessage::Request { text: false } => {}
+        ClipMessage::Request { text: true } => {
+            let text = ch.shared.lock().unwrap().local_text.clone();
+            if let Some(text) = text {
+                ch.send(xclip::provide_text(&text))?;
+            }
+        }
+        ClipMessage::Peek => {
+            let has_text = ch.shared.lock().unwrap().local_text.is_some();
+            ch.send(xclip::notify(has_text))?;
+        }
+        ClipMessage::Provide(Some(text)) => sink.cut_text(text),
+        ClipMessage::Provide(None) => {}
+    }
+    Ok(())
+}
+
+/// Opens the byte stream to the VNC server, through SSH if configured.
+async fn open(p: &ConnectParams) -> rfb::Result<BoxStream> {
+    if let Some(tunnel) = &p.ssh {
+        return ssh::tunnel(tunnel, p.host.trim(), p.port).await;
+    }
+    let stream = TcpStream::connect((p.host.trim(), p.port)).await?;
+    stream.set_nodelay(true)?;
+    Ok(Box::new(stream))
 }
 
 pub fn encode_event(ev: &Event) -> Vec<u8> {

@@ -1,13 +1,26 @@
 //! Minimal RFB (VNC) client protocol implementation (RFC 6143).
 
+pub mod ard;
 pub mod auth;
+pub mod clipboard;
 pub mod decode;
 pub mod framebuffer;
 pub mod proto;
+pub mod security;
+pub mod tight;
+pub mod tls;
+
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub use decode::{CursorShape, Decoder, ServerMessage};
 pub use framebuffer::{Framebuffer, Rect};
 pub use proto::{ServerInit, handshake};
+pub use security::{Security, SecurityOptions};
+
+/// A byte stream the protocol runs over: TCP, TLS, an SSH channel…
+pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
+pub type BoxStream = Box<dyn Stream>;
 
 /// Connection errors. `Display` (English) is for logs; the UI receives an
 /// [`ErrorInfo`] and translates it.
@@ -24,6 +37,8 @@ pub enum Error {
     AuthFailed(Option<String>),
     #[error("password required")]
     PasswordRequired,
+    #[error("user name and password required")]
+    CredentialsRequired,
     #[error("no supported security type (offered: {0:?})")]
     UnsupportedSecurity(Vec<u32>),
     #[error("unsupported encoding {0}")]
@@ -37,6 +52,26 @@ pub enum Error {
     Malformed(String),
     #[error("connection lost")]
     ConnectionLost,
+    /// The server's TLS certificate is neither signed by a known authority nor
+    /// trusted by the user; the detail is its SHA-256 fingerprint.
+    #[error("untrusted certificate ({0})")]
+    UntrustedCertificate(String),
+    #[error("TLS error: {0}")]
+    Tls(String),
+    /// VeNCrypt was chosen but offers no usable subtype (e.g. only anonymous TLS).
+    #[error("no usable VeNCrypt subtype (offered: {0:?})")]
+    VencryptUnusable(Vec<u32>),
+    #[error("cancelled")]
+    Cancelled,
+    #[error("SSH error: {0}")]
+    Ssh(String),
+    #[error("SSH authentication failed")]
+    SshAuthFailed,
+    /// Host key not in `known_hosts`; the detail is its fingerprint.
+    #[error("unknown SSH host key ({0})")]
+    SshHostKeyUnknown(String),
+    #[error("SSH host key changed ({0})")]
+    SshHostKeyChanged(String),
 }
 
 /// Language-neutral description of an [`Error`], sent to the UI.
@@ -61,21 +96,22 @@ impl Error {
             Error::Server(reason) => ("serverRefused", Some(reason.clone())),
             Error::AuthFailed(reason) => ("authFailed", reason.clone()),
             Error::PasswordRequired => ("passwordRequired", None),
-            Error::UnsupportedSecurity(types) => (
-                "unsupportedSecurity",
-                Some(
-                    types
-                        .iter()
-                        .map(u32::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-            ),
+            Error::CredentialsRequired => ("credentialsRequired", None),
+            Error::UnsupportedSecurity(types) | Error::VencryptUnusable(types) => {
+                ("unsupportedSecurity", Some(security::describe(types)))
+            }
             Error::UnsupportedEncoding(e) => ("unsupportedEncoding", Some(e.to_string())),
             Error::ScreenTooLarge(w, h) => ("screenTooLarge", Some(format!("{w}×{h}"))),
             Error::UnknownMessage(t) => ("unknownMessage", Some(t.to_string())),
             Error::Malformed(d) => ("malformed", Some(d.clone())),
             Error::ConnectionLost => ("connectionLost", None),
+            Error::UntrustedCertificate(fp) => ("untrustedCertificate", Some(fp.clone())),
+            Error::Tls(d) => ("tls", Some(d.clone())),
+            Error::Cancelled => ("cancelled", None),
+            Error::Ssh(d) => ("ssh", Some(d.clone())),
+            Error::SshAuthFailed => ("sshAuthFailed", None),
+            Error::SshHostKeyUnknown(fp) => ("sshHostKeyUnknown", Some(fp.clone())),
+            Error::SshHostKeyChanged(fp) => ("sshHostKeyChanged", Some(fp.clone())),
         };
         ErrorInfo { code, detail }
     }
@@ -98,7 +134,10 @@ mod tests {
             }
         );
         let e = Error::UnsupportedSecurity(vec![16, 19]);
-        assert_eq!(e.info().detail.as_deref(), Some("16, 19"));
+        assert_eq!(
+            e.info().detail.as_deref(),
+            Some("16 (Tight), 19 (VeNCrypt)")
+        );
         let json = serde_json::to_string(&Error::AuthFailed(None).info()).unwrap();
         assert_eq!(json, r#"{"code":"authFailed"}"#);
     }

@@ -8,7 +8,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::framebuffer::{Framebuffer, Rect};
 use super::proto::{encoding, latin1_decode};
-use super::{Error, Result};
+use super::tight::Tight;
+use super::{Error, Result, clipboard};
 
 const MAX_CUT_TEXT: usize = 16 << 20;
 const MAX_ZRLE_DATA: usize = 64 << 20;
@@ -20,6 +21,8 @@ pub enum ServerMessage {
     SetColourMap,
     Bell,
     CutText(String),
+    /// Extended clipboard message.
+    Clipboard(clipboard::Message),
 }
 
 /// Result of one FramebufferUpdate.
@@ -31,6 +34,19 @@ pub struct Update {
     pub resized: bool,
     /// New cursor shape (Cursor pseudo-encoding).
     pub cursor: Option<CursorShape>,
+    /// ExtendedDesktopSize was received: the server can resize on request.
+    pub desktop: Option<DesktopLayout>,
+}
+
+/// Screen layout reported by ExtendedDesktopSize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopLayout {
+    /// Id of the first screen, to reuse when asking for a new size.
+    pub screen_id: u32,
+    /// Why it was sent: 0 server-side change, 1 our request, 2 another client.
+    pub reason: u16,
+    /// 0 on success; otherwise our resize request was refused.
+    pub status: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +64,7 @@ pub struct Decoder {
     zlib: Decompress,
     inflated: Vec<u8>,
     scratch: Vec<u8>,
+    tight: Tight,
 }
 
 impl Default for Decoder {
@@ -62,6 +79,7 @@ impl Decoder {
             zlib: Decompress::new(true),
             inflated: Vec::new(),
             scratch: Vec::new(),
+            tight: Tight::default(),
         }
     }
 
@@ -93,14 +111,20 @@ impl Decoder {
             3 => {
                 let mut pad = [0u8; 3];
                 r.read_exact(&mut pad).await?;
-                let len = r.read_u32().await? as usize;
-                if len > MAX_CUT_TEXT {
+                // A negative length marks an extended clipboard message.
+                let len = r.read_i32().await?;
+                let size = len.unsigned_abs() as usize;
+                if size > MAX_CUT_TEXT {
                     return Err(Error::Malformed(format!(
-                        "clipboard text too large ({len} bytes)"
+                        "clipboard text too large ({size} bytes)"
                     )));
                 }
-                self.read_into_scratch(r, len).await?;
-                Ok(ServerMessage::CutText(latin1_decode(&self.scratch)))
+                self.read_into_scratch(r, size).await?;
+                if len < 0 {
+                    clipboard::parse(&self.scratch).map(ServerMessage::Clipboard)
+                } else {
+                    Ok(ServerMessage::CutText(latin1_decode(&self.scratch)))
+                }
             }
             t => Err(Error::UnknownMessage(t)),
         }
@@ -136,6 +160,16 @@ impl Decoder {
                     update.cursor = Some(self.read_cursor(r, rect).await?);
                     continue;
                 }
+                encoding::EXTENDED_DESKTOP_SIZE => {
+                    let layout = self.read_desktop_layout(r, rect).await?;
+                    if (rect.w, rect.h) != (fb.width(), fb.height()) && layout.status == 0 {
+                        fb.resize(rect.w, rect.h)?;
+                        update.resized = true;
+                        update.dirty.clear();
+                    }
+                    update.desktop = Some(layout);
+                    continue;
+                }
                 _ => {}
             }
             if !fb.contains(rect) {
@@ -155,6 +189,7 @@ impl Decoder {
                 encoding::RRE => self.read_rre(r, fb, rect).await?,
                 encoding::HEXTILE => self.read_hextile(r, fb, rect).await?,
                 encoding::ZRLE => self.read_zrle(r, fb, rect).await?,
+                encoding::TIGHT => self.tight.read_rect(r, fb, rect).await?,
                 e => return Err(Error::UnsupportedEncoding(e)),
             }
             if !rect.is_empty() {
@@ -294,6 +329,25 @@ impl Decoder {
         Ok(())
     }
 
+    /// ExtendedDesktopSize: x is the reason, y the status; then the screens.
+    async fn read_desktop_layout<R: AsyncRead + Unpin>(
+        &mut self,
+        r: &mut R,
+        rect: Rect,
+    ) -> Result<DesktopLayout> {
+        let screens = r.read_u8().await? as usize;
+        self.read_into_scratch(r, 3 + screens * 16).await?;
+        let screen_id = self
+            .scratch
+            .get(3..7)
+            .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()));
+        Ok(DesktopLayout {
+            screen_id,
+            reason: rect.x,
+            status: rect.y,
+        })
+    }
+
     async fn read_cursor<R: AsyncRead + Unpin>(
         &mut self,
         r: &mut R,
@@ -350,7 +404,7 @@ fn sub_rect(parent: Rect, sub: Rect) -> Result<Rect> {
 }
 
 /// Feeds all of `input` to the persistent zlib stream; output goes to `out`.
-fn inflate(z: &mut Decompress, input: &[u8], out: &mut Vec<u8>) -> Result<()> {
+pub(super) fn inflate(z: &mut Decompress, input: &[u8], out: &mut Vec<u8>) -> Result<()> {
     out.clear();
     let mut consumed = 0;
     loop {
